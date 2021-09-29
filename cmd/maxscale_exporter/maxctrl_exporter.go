@@ -14,22 +14,23 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
-	"strings"
 
+	"github.com/go-kit/kit/log/level"
+	"github.com/pgporada/maxscale_exporter/pkg/exporter"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/promlog"
+	"github.com/prometheus/common/promlog/flag"
+	"github.com/prometheus/common/version"
+	"github.com/prometheus/exporter-toolkit/web"
+	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
+	"gopkg.in/alecthomas/kingpin.v2"
 )
 
-const (
-	metricsPath = "/metrics"
-	localIP     = "0.0.0.0"
-)
-
+/*
 // MaxScale contains connection parameters to the server and metric maps
 type MaxScale struct {
 	address               string
@@ -42,7 +43,94 @@ type MaxScale struct {
 	maxscaleStatusMetrics map[string]Metric
 	statusMetrics         map[string]Metric
 }
+*/
 
+type promHTTPLogger struct {
+	logger log.logger
+}
+
+func (l promHTTPLogger) Println(v ...interface{}) {
+	level.Error(l.logger).Log("msg", fmt.Sprint(v...))
+}
+
+func init() {
+	prometheus.MustRegister(version.NewCollector("maxscale_exporter"))
+}
+
+func main() {
+	var (
+		webConfig     = webflag.AddFlags(kingpin.CommandLine)
+		listenAddress = kingpin.Flag("web.listen-address", "Address to listen on for telemetry.").Default("0.0.0.0:8080").String()
+		metricsPath   = kingpin.Flag("web.metrics-path", "Path which to expose metrics.").Default("/metrics").String()
+	)
+	kingpin.Flag("maxctrl.server", "REST API address for Maxscale. (prefix with https:// to connect over HTTPS)").Default("http://127.0.0.1:8989").StringVar(&opts.URI)
+	kingpin.Flag("maxctrl.ca-file", "File path to a PEM-encoded certificate authority used to validate the authenticity of a server certificate.").Default("").StringVar(&opts.CAFile)
+	kingpin.Flag("maxctrl.cert-file", "File path to a PEM-encoded certificate used with the private key to verify the exporter's authenticity.").Default("").StringVar(&opts.CertFile)
+	kingpin.Flag("maxctrl.key-file", "File path to a PEM-encoded private key used with the certificate to verify the exporter's authenticity.").Default("").StringVar(&opts.KeyFile)
+	kingpin.Flag("maxctrl.server-name", "When provided, this overrides the hostname for the TLS certificate. It can be used to ensure that the certificate name matches the hostname we declare.").Default("").StringVar(&opts.ServerName)
+	kingpin.Flag("maxctrl.timeout", "Timeout on HTTP requests to the Maxscale REST API.").Default("1000ms").DurationVar(&opts.Timeout)
+	kingpin.Flag("maxctrl.insecure", "Disable TLS host verification.").Default("false").BoolVar(&opts.Insecure)
+
+	promlogConfig := &promlog.Config{}
+	flag.AddFlags(kingpin.CommandLine, promlogConfig)
+	kingpin.HelpFlag.Short('h')
+	kingpin.Parse()
+	logger := promlog.New(promlogConfig)
+
+	level.Info(logger).Log("msg", "Starting maxctrl_exporter", "version", version.Info())
+	level.Info(logger).Log("build_context", version.BuildContext())
+
+	exporter, err := exporter.New(opts, logger)
+	if err != nil {
+		level.Error(logger).Log("msg", "Error creating the exporter", "err", err)
+		os.Exit(1)
+	}
+
+	http.Handle(*metricsPath,
+		promhttp.InstrumentMetricHandler(
+			prometheus.DefaultRegisterer,
+			promhttp.HandlerFor(
+				prometheus.DefaultGatherer,
+				promhttp.HandlerOpts{
+					ErrorLog: &promHTTPLogger{
+						logger: logger,
+					},
+				},
+			),
+		),
+	)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<html>
+             <head><title>Maxscale Exporter</title></head>
+             <body>
+             <h1>Maxscale Exporter</h1>
+             <p><a href='` + *metricsPath + `'>Metrics</a></p>
+             <h2>Options</h2>
+             </dl>
+             <h2>Build</h2>
+             <pre>` + version.Info() + ` ` + version.BuildContext() + `</pre>
+             </body>
+             </html>`))
+	})
+	http.HandleFunc("/-/healthy", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "OK")
+	})
+	http.HandleFunc("/-/ready", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "OK")
+	})
+
+	level.Info(logger).Log("msg", "Listening on address", "address", *listenAddress)
+	srv := &http.Server{Addr: *listenAddress}
+	if err := web.ListenAndServe(srv, *webConfig, logger); err != nil {
+		level.Error(logger).Log("msg", "Error starting HTTP server", "err", err)
+		os.Exit(1)
+	}
+
+}
+
+/*
 // NewExporter creates a new instance of the MaxScale
 func NewExporter(address string, username string, password string) (*MaxScale, error) {
 	return &MaxScale{
@@ -319,6 +407,7 @@ func main() {
 	}
 
 	prometheus.MustRegister(exporter)
+
 	http.Handle(metricsPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`<html>
@@ -332,3 +421,4 @@ func main() {
 	log.Printf("Started MaxScale exporter, listening on port: %v", maxScaleExporterPort)
 	log.Fatal(http.ListenAndServe(localIP+":"+maxScaleExporterPort, nil))
 }
+*/

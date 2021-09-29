@@ -11,15 +11,119 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package exporter
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	_ "net/http/pprof"
 
-// Namespace for Prometheus
+	"github.com/prometheus/client_golang/prometheus"
+)
+
 const (
 	Namespace = "maxctrl"
 )
 
+// Exporter collects Maxscale stats from the given server and exports them
+// using the prometheus metrics package
+type Exporter struct {
+	client *maxscale.Client
+	logger log.Logger
+}
+
+// MaxscaleOpts configures options for connecting to Maxscale
+type MaxscaleOpts struct {
+	URI        string
+	CAFile     string
+	CertFile   string
+	KeyFile    string
+	ServerName string
+	Timeout    time.Duration
+	Insecure   bool
+}
+
+// New returns an initialized Exporter.
+func New(opts MaxscaleOpts, logger log.Logger) (*Exporter, error) {
+	uri := opts.URI
+	if !strings.Contains(uri, "://") {
+		uri = "http://" + uri
+	}
+	u, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("invalid maxctrl URL: %s", err)
+	}
+	if u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return nil, fmt.Errorf("invalid maxctrl URL: %s", uri)
+	}
+
+	tlsConfig, err := maxctrl_api.SetupTLSConfig(&maxctrl_api.TLSConfig{
+		Address:            opts.ServerName,
+		CAFile:             opts.CAFile,
+		CertFile:           opts.CertFile,
+		KeyFile:            opts.KeyFile,
+		InsecureSkipVerify: opts.Insecure,
+	})
+	if err != nil {
+		return nil, err
+	}
+	transport := cleanhttp.DefaultPooledTransport()
+	transport.TLSClientConfig = tlsConfig
+
+	config := maxctrl_api.DefaultConfig()
+	config.Address = u.Host
+	config.Scheme = u.Scheme
+	if config.HttpClient == nil {
+		config.HttpClient = &http.Client{}
+	}
+	config.HttpClient.Timeout = opts.Timeout
+	config.HttpClient.Transport = transport
+
+	client, err := consul_api.NewClient(config)
+	if err != nil {
+		return nil, err
+	}
+
+	// Init our exporter.
+	return &Exporter{
+		client: client,
+		logger: logger,
+	}, nil
+}
+
+// Describe describes all the metrics ever exported by the maxctrl exporter. It
+// implements prometheus.Collector.
+func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
+	ch <- up
+}
+
+// Collect fetches the stats from configured maxctrl location and delivers them
+// as Prometheus metrics. It implements prometheus.Collector.
+func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
+	ok := e.collectPeersMetric(ch)
+
+	if ok {
+		ch <- prometheus.MustNewConstMetric(
+			up, prometheus.GaugeValue, 1.0,
+		)
+	} else {
+		ch <- prometheus.MustNewConstMetric(
+			up, prometheus.GaugeValue, 0.0,
+		)
+	}
+}
+
+func (e *Exporter) collectPeersMetric(ch chan<- prometheus.Metric) bool {
+	peers, err := e.client.Status().Peers()
+	if err != nil {
+		level.Error(e.logger).Log("msg", "Can't query maxctrl", "err", err)
+		return false
+	}
+	ch <- prometheus.MustNewConstMetric(
+		clusterServers, prometheus.GaugeValue, float64(len(peers)),
+	)
+	return true
+}
+
+/*
 // Metric for Prometheus consists of value desciption and type
 type Metric struct {
 	Desc      *prometheus.Desc
@@ -83,3 +187,4 @@ var (
 		"status_query_classifier_cache_evictions": newDesc("status", "query_classifier_cache_evictions", "The number of evictions in the query classifier cache", statusLabelNames, prometheus.GaugeValue),
 	}
 )
+*/
